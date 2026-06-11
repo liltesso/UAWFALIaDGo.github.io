@@ -1,37 +1,31 @@
-"""Tiny in-process TTL cache for the MRKT catalog.
+FROM python:3.12-slim AS builder
 
-Per spec §4: do NOT hammer MRKT on every Mini App open. Cache catalog pages
-for a few seconds. For a multi-worker deployment, swap this for Redis — the
-interface (`get` / `set`) stays identical.
-"""
-from __future__ import annotations
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-import time
-from typing import Any
+WORKDIR /build
+COPY requirements.txt ./
+RUN pip install --prefix=/install -r requirements.txt
 
-from .config import settings
+FROM python:3.12-slim AS runtime
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8000
 
-class TTLCache:
-    def __init__(self, ttl: int):
-        self.ttl = ttl
-        self._store: dict[str, tuple[float, Any]] = {}
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY app/ ./app/
+COPY bot.py ./
 
-    def get(self, key: str) -> Any | None:
-        item = self._store.get(key)
-        if not item:
-            return None
-        expires_at, value = item
-        if time.monotonic() > expires_at:
-            self._store.pop(key, None)
-            return None
-        return value
+RUN groupadd --system app && useradd --system --gid app --home /app appuser \
+    && chown -R appuser:app /app
+USER appuser
 
-    def set(self, key: str, value: Any) -> None:
-        self._store[key] = (time.monotonic() + self.ttl, value)
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
 
-    def clear(self) -> None:
-        self._store.clear()
-
-
-catalog_cache = TTLCache(ttl=settings.catalog_cache_ttl)
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
